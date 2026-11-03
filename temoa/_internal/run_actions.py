@@ -244,7 +244,7 @@ def solve_instance(
                     if dual_suffix is not None:
                         dual_suffix.direction = original_direction
             else:
-                result = optimizer.solve(instance, suffixes=solver_suffixes_list)
+                result = optimizer.solve(instance, suffixes=solver_suffixes_list, tee=True)
         except RuntimeError as error:
             logger.exception('Solver failed to solve and returned an error: %s', error)
             logger.error(
