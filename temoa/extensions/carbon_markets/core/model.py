@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-from pyomo.environ import BuildAction, Constraint, NonNegativeReals, Param, Reals, Set, Var
+from pyomo.environ import BuildAction, Constraint, NonNegativeReals, Param, Set, Var
 
 from temoa.extensions.carbon_markets.components import cap_and_trade
 
@@ -44,8 +44,8 @@ def register_model_components(model: TemoaModel) -> None:
     # (region, period, tech, vintage, emission commodity)
     m.cap_and_trade_rptvert = Set(dimen=5, initialize=cap_and_trade.cap_and_trade_indices)
 
-    # Net credits for a process: positive = bought, negative = sold
-    m.v_cap_and_trade_credit = Var(m.cap_and_trade_rptvert, domain=Reals)
+    # Credits bought by a process to emit above its cap
+    m.v_cap_and_trade_credit = Var(m.cap_and_trade_rptvert, domain=NonNegativeReals)
 
     m.cap_and_trade_balance_constraint = Constraint(
         m.cap_and_trade_rptvert, rule=cap_and_trade.cap_and_trade_balance_constraint_rule

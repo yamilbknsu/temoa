@@ -5,12 +5,12 @@ emissions of commodity e in period p are limited per unit of capacity:
 
 .. math::
 
-    EM_{r,p,t,v,e} - CAP_{r,p,t,v,e} \cdot CAPACITY_{r,p,t,v} = \textbf{CR}_{r,p,t,v,e}
+    EM_{r,p,t,v,e} \le CAP_{r,p,t,v,e} \cdot CAPACITY_{r,p,t,v} + \textbf{CR}_{r,p,t,v,e}
     \qquad
-    \textbf{CR}_{r,p,t,v,e} \le CL_{r,p,t,v,e} \cdot CAPACITY_{r,p,t,v}
+    0 \le \textbf{CR}_{r,p,t,v,e} \le CL_{r,p,t,v,e} \cdot CAPACITY_{r,p,t,v}
 
-where CR is the net credits bought. Credits bought (CR > 0) are purchased at the
-fixed price ``credit_cost``; a process under its cap (CR < 0) is paid the same price.
+where CR is the credits bought, at the fixed price ``credit_cost``, to emit above
+the cap. Unused headroom under the cap earns nothing.
 The cost ``credit_cost * CR`` is added, discounted, to the objective.
 """
 
@@ -80,7 +80,7 @@ def cap_and_trade_balance_constraint_rule(
     cap = value(model.cap_and_trade_cap[r, p, t, v, e])
     return (
         _process_emissions(model, r, p, t, v, e)
-        == cap * model.v_capacity[r, p, t, v] + model.v_cap_and_trade_credit[r, p, t, v, e]
+        <= cap * model.v_capacity[r, p, t, v] + model.v_cap_and_trade_credit[r, p, t, v, e]
     )
 
 
@@ -92,7 +92,7 @@ def cap_and_trade_credit_limit_constraint_rule(
 
 
 def append_credit_costs(model: CarbonMarketsModel) -> None:
-    """Add discounted net credit purchases (negative when sold) to the objective."""
+    """Add discounted credit purchases to the objective."""
     p_0 = min(model.time_optimize)
     gdr = value(model.global_discount_rate)
 
