@@ -173,6 +173,15 @@ class TemoaModel(AbstractModel):
         # {(r, t, v): set(p)} periods for which the process has a defined survival fraction
         self.survival_curve_periods: t.SurvivalCurvePeriodsDict = {}
         """current available (within lifespan) vintages {(r, p, t) : set(v)}"""
+        # {(r, p, t, v): [(s, d), ...]} the only time slices whose capacity constraint can bind
+        # for annual techs with DSD outputs. None until computed (see capacity module).
+        self.annual_dsd_binding_hours: (
+            dict[
+                tuple[t.Region, t.Period, t.Technology, t.Vintage],
+                list[tuple[t.Season, t.TimeOfDay]],
+            ]
+            | None
+        ) = None
 
         self.baseload_vintages: t.BaseloadVintagesDict = {}
         self.curtailment_vintages: t.CurtailmentVintagesDict = {}
@@ -555,6 +564,9 @@ class TemoaModel(AbstractModel):
         self.capacity_annual_constraint_rptv = Set(
             dimen=4, initialize=capacity.capacity_annual_constraint_indices
         )
+        self.capacity_dsd_constraint_rpsdtv = Set(
+            dimen=6, initialize=capacity.capacity_dsd_constraint_indices
+        )
         self.capacity_constraint_rpsdtv = Set(
             dimen=6, initialize=capacity.capacity_constraint_indices
         )
@@ -853,6 +865,10 @@ class TemoaModel(AbstractModel):
         )
         self.capacity_annual_constraint = Constraint(
             self.capacity_annual_constraint_rptv, rule=capacity.capacity_annual_constraint
+        )
+        # Same rule as capacity_constraint, restricted to the time slices that can bind
+        self.capacity_dsd_constraint = Constraint(
+            self.capacity_dsd_constraint_rpsdtv, rule=capacity.capacity_constraint
         )
 
         self.capacity_available_by_period_and_tech_constraint = Constraint(

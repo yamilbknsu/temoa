@@ -25,6 +25,7 @@ from .utils import get_adjusted_existing_capacity, get_available_output
 if TYPE_CHECKING:
     from temoa.core.model import TemoaModel
     from temoa.types import (
+        Commodity,
         ExprLike,
         Period,
         Region,
@@ -221,17 +222,208 @@ def capacity_annual_constraint_indices(
     }
 
 
+def capacity_dsd_constraint_indices(
+    model: TemoaModel,
+) -> set[tuple[Region, Period, Season, TimeOfDay, Technology, Vintage]]:
+    """Capacity rows for annual techs with DSD outputs, only in the hours that can bind."""
+    return {
+        (r, p, s, d, t, v)
+        for (r, p, t, v), hours in annual_dsd_binding_hours(model).items()
+        for s, d in hours
+    }
+
+
 def capacity_constraint_indices(
     model: TemoaModel,
 ) -> set[tuple[Region, Period, Season, TimeOfDay, Technology, Vintage]]:
+    dsd_reduced = annual_dsd_binding_hours(model)
     return {
         (r, p, s, d, t, v)
         for r, p, t, v in model.active_capacity_rptv
         if (r, p, t, v) not in model.capacity_annual_constraint_rptv
+        and (r, p, t, v) not in dsd_reduced
         for s in model.time_season
         for d in model.time_of_day
         if t not in model.tech_storage
     }
+
+
+# ============================================================================
+# BINDING-HOUR REDUCTION FOR ANNUAL TECHS WITH DSD OUTPUTS
+# ============================================================================
+
+# Relative tolerance for treating a ratio profile as flat
+_FLAT_TOL = 1e-9
+# Relative tolerance for the 2D hull test. A point is only dropped when it lies clearly
+# inside the hull; unclear cases are kept (an extra row is redundant, never wrong).
+_HULL_TOL = 1e-12
+
+
+def _upper_right_hull_2d(points: list[tuple[float, float]]) -> list[int]:
+    """
+    Indices of the points that are needed to describe max_h (x_h*a + y_h*b) for all a, b >= 0.
+
+    These are the vertices of the upper-right convex hull between the point with the largest x
+    and the point with the largest y. Every other point is dominated by a convex combination of
+    these, so its row is implied. Exact duplicates keep the first occurrence only.
+    """
+    # 1. Pareto filter. Sweep x descending (ties: y descending, then index ascending) and keep a
+    #    point only if its y is strictly larger than everything seen so far.
+    order = sorted(range(len(points)), key=lambda i: (-points[i][0], -points[i][1], i))
+    pareto: list[int] = []
+    best_y = float('-inf')
+    for i in order:
+        if points[i][1] > best_y:
+            pareto.append(i)
+            best_y = points[i][1]
+    # now x descending, y ascending -> flip to x ascending, y descending
+    pareto.reverse()
+    if len(pareto) <= 2:
+        return pareto
+
+    # 2. Monotone chain over the Pareto front (left to right). Drop the middle point a of
+    #    (o, a, b) when it lies strictly below the segment o -> b (clockwise turn missing).
+    scale = max(max(abs(x), abs(y)) for x, y in points) or 1.0
+    eps = _HULL_TOL * scale * scale
+    chain: list[int] = []
+    for i in pareto:
+        bx, by = points[i]
+        while len(chain) >= 2:
+            ox, oy = points[chain[-2]]
+            ax, ay = points[chain[-1]]
+            cross = (ax - ox) * (by - oy) - (ay - oy) * (bx - ox)
+            if cross > eps:
+                chain.pop()
+            else:
+                break
+        chain.append(i)
+    return chain
+
+
+def annual_dsd_binding_hours(
+    model: TemoaModel,
+) -> dict[tuple[Region, Period, Technology, Vintage], list[tuple[Season, TimeOfDay]]]:
+    r"""
+    For annual techs whose outputs carry a demand-specific distribution (DSD), find the only
+    time slices whose capacity constraint can bind. Computed once and cached on the model.
+
+    An annual tech has one flow variable per (i, o) per year, so its hourly capacity row is
+    (after dividing through by :math:`\text{SEG}_{s,d}`)
+
+    .. math::
+        \text{C2A}_{r,t} \cdot \textbf{CAP}_{r,p,t,v}
+        \ge \sum_{I,O} \rho_{o}(s,d) \cdot \textbf{FOA}_{r,p,i,t,v,o},
+        \quad \rho_{o}(s,d) = \text{DSD}_{r,p,s,d,o} / \text{SEG}_{s,d}
+
+    (outputs that are not demands have :math:`\rho = 1`). Since the flows are non-negative,
+    a row is implied whenever its :math:`\rho` vector is covered by a convex combination of
+    the other rows' vectors, so only the upper-right hull of the points :math:`\rho(s,d)` is
+    needed:
+
+    - Outputs with a flat :math:`\rho` add the same term to every row and are ignored, and
+      outputs with identical profiles are merged. Let k be the number of distinct profiles left.
+    - k = 0: every row is the same; keep one.
+    - k = 1: keep the hour with the largest :math:`\rho`.
+    - k = 2: keep the vertices of the 2D upper-right hull.
+    - k >= 3: not reduced; the process keeps all hourly rows in ``capacity_constraint``.
+
+    Processes eligible are those that would use ``capacity_constraint`` only because of a DSD
+    output: annual, no capacity factor entries, not curtailment or storage.
+
+    :return: {(r, p, t, v): [(s, d), ...]} for every reduced process
+    """
+    if model.annual_dsd_binding_hours is not None:
+        return model.annual_dsd_binding_hours
+
+    result: dict[tuple[Region, Period, Technology, Vintage], list[tuple[Season, TimeOfDay]]] = {}
+    model.annual_dsd_binding_hours = result
+
+    hours: list[tuple[Season, TimeOfDay]] = list(
+        cross_product(model.time_season, model.time_of_day)
+    )
+    n_hours = len(hours)
+    if n_hours == 0:
+        return result
+    seg = [value(model.segment_fraction[s, d]) for s, d in hours]
+    if min(seg) <= 0:
+        # rho undefined; leave every process on the hourly path
+        logger.info('Some segment_fraction values are not positive; DSD capacity reduction off.')
+        return result
+
+    cft_rt = {(r, t) for r, _s, _d, t in model.capacity_factor_tech.sparse_keys()}
+    cfp_rtv = {(r, t, v) for r, _s, _d, t, v in model.capacity_factor_process.sparse_keys()}
+    dsd = model.demand_specific_distribution
+
+    # (r, p, o) -> rho profile, or None if flat
+    profile_cache: dict[tuple[Region, Period, Commodity], tuple[float, ...] | None] = {}
+
+    def profile(r: Region, p: Period, o: Commodity) -> tuple[float, ...] | None:
+        key = (r, p, o)
+        if key not in profile_cache:
+            rho = tuple(value(dsd[r, p, s, d, o]) / seg[h] for h, (s, d) in enumerate(hours))
+            hi, lo = max(rho), min(rho)
+            profile_cache[key] = None if hi - lo <= _FLAT_TOL * max(abs(hi), 1.0) else rho
+        return profile_cache[key]
+
+    # set of distinct profiles -> kept hour indices (None if k >= 3)
+    hull_cache: dict[frozenset[tuple[float, ...]], list[int] | None] = {}
+    skipped: dict[Technology, set[Region]] = {}
+
+    for r, p, t, v in sorted(model.active_capacity_rptv):
+        if (
+            t not in model.tech_annual
+            or t in model.tech_curtailment
+            or t in model.tech_storage
+            or (r, t) in cft_rt
+            or (r, t, v) in cfp_rtv
+        ):
+            continue
+        outputs = model.process_outputs[r, p, t, v]
+        if not any(o in model.commodity_dsd for o in outputs):
+            continue  # handled by capacity_annual_constraint
+
+        # non-demand outputs use SEG as coefficient, i.e. a flat rho of 1
+        demand_profiles = (profile(r, p, o) for o in outputs if o in model.commodity_demand)
+        profiles = frozenset(prof for prof in demand_profiles if prof is not None)
+        if profiles not in hull_cache:
+            k = len(profiles)
+            if k == 0:
+                kept: list[int] | None = [0]
+            elif k == 1:
+                (rho,) = profiles
+                kept = [max(range(n_hours), key=rho.__getitem__)]
+            elif k == 2:
+                rho_a, rho_b = sorted(profiles)
+                kept = sorted(_upper_right_hull_2d(list(zip(rho_a, rho_b, strict=True))))
+            else:
+                kept = None
+            hull_cache[profiles] = kept
+
+        kept = hull_cache[profiles]
+        if kept is None:
+            skipped.setdefault(t, set()).add(r)
+            continue
+        result[r, p, t, v] = [hours[h] for h in kept]
+
+    for t in sorted(skipped):
+        logger.warning(
+            'Annual technology %s has 3 or more distinct demand-specific distribution profiles '
+            'on its outputs in regions %s; using all hourly capacity rows.',
+            t,
+            sorted(skipped[t]),
+        )
+    if result:
+        rows_after = sum(len(h) for h in result.values())
+        logger.info(
+            'Reduced hourly capacity rows for %d annual DSD processes: %d -> %d rows '
+            '(%d time slices per process before, %.2f on average after).',
+            len(result),
+            len(result) * n_hours,
+            rows_after,
+            n_hours,
+            rows_after / len(result),
+        )
+    return result
 
 
 def capacity_factor_tech_indices(
